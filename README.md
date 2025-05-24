@@ -1,6 +1,10 @@
-# dalvikscript README
+# DalvikScript
 
-This is the README for your extension "dalvikscript". After writing up a brief description, we recommend including the following sections.
+This is an vscode extension to execute Java code on Android devices without compiling into apps.
+The rest of the readme will be filled later.
+
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## Features
 
