@@ -1,0 +1,88 @@
+{
+  "name": "dalvikscript",
+  "publisher": "legendsayantan",
+  "displayName": "DalvikScript",
+  "description": "Allows Raw Java code to be run on Android Devices, without building apk.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:java",
+    "onLanguage:kotlin",
+    "onCommand:dalvikScript.runOnDevice"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dalvikscript.runOnDevice",
+        "title": "Run on Android"
+      }
+    ],
+    "configuration": [
+      {
+        "title": "dalvikscript",
+        "properties": {
+          "dalvikscript.androidSdkPath":{
+            "type": "string",
+            "description": "Full path to your android sdk directory. Download it here - https://developer.android.com/studio#command-line-tools-only",
+            "default": "C:\\Users\\Admin\\AppData\\Local\\Android\\Sdk"
+          },
+          "dalvikscript.javaHome": {
+            "type": "string",
+            "description": "Full path to your java home, Java 17 or higher.",
+            "default": "C:\\Users\\Admin\\.jdks\\openjdk-23.0.1"
+          },
+          "dalvikscript.kotlincPath": {
+            "type": "string",
+            "description": "Full path to your kotlin compiler folder, download it here - https://github.com/JetBrains/kotlin/releases",
+            "default": "C:\\Users\\Admin\\.jdks\\kotlinc"
+          },
+          "dalvikscript.dalvikOnly": {
+            "type": "boolean",
+            "description": "Run as dalvik only, not app_process",
+            "default": false
+          }
+        }
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "dalvikscript.runOnDevice",
+          "when": "resourceLangId == java || resourceLangId == kotlin",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.100.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "20.x",
+    "@typescript-eslint/eslint-plugin": "^8.31.1",
+    "@typescript-eslint/parser": "^8.31.1",
+    "eslint": "^9.25.1",
+    "typescript": "^5.8.3",
+    "ts-loader": "^9.5.2",
+    "webpack": "^5.99.7",
+    "webpack-cli": "^6.0.1",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
