@@ -15,6 +15,10 @@ export function activate(context: vscode.ExtensionContext) {
 		return;
 	}
 	const adbPath = path.join(androidSdkPath, "platform-tools", "adb.exe");
+	if (!fs.existsSync(adbPath)) {
+		vscode.window.showErrorMessage(`Android SDK path is not valid. Please check dalvikscript.androidSdkPath.`);
+		return;
+	}
 	checkDevicesPresent(adbPath);
 	context.subscriptions.push(
 		vscode.commands.registerCommand('dalvikscript.runOnDevice', async () => {
@@ -45,7 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
 				}
 				await downloadAndroidJar(sdkversion, (jarPath) => {
 					vscode.window.showInformationMessage(`Compiling files for SDK ${sdkversion}...`);
-					compileForDalvik(files, jarPath, androidSdkPath, (success, outputPath) => {
+					compileForDalvik(files, sdkversion, jarPath, androidSdkPath, (success, outputPath) => {
 						if (!success) {
 							vscode.window.showErrorMessage('Compilation failed.');
 							return;
@@ -60,8 +64,8 @@ export function activate(context: vscode.ExtensionContext) {
 									//execution
 									let dalvikOnly = config.get<boolean>('dalvikOnly');
 									let mainClass = await vscode.window.showInputBox({
-										prompt: 'Enter the main class to run (e.g., com.example.Main)',
-										value: 'com.example.Main'
+										prompt: 'Enter the main class to run + arguments',
+										placeHolder: 'com.example.Main arg1 arg2',
 									});
 									if (!mainClass) {
 										vscode.window.showErrorMessage('Main class is required to run the script.');
@@ -73,7 +77,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 
 									//Run the command on the vscode terminal
-									const terminal = vscode.window.activeTerminal || vscode.window.createTerminal({
+									const terminal = vscode.window.createTerminal({
 										name: `Run on ${device}`,
 										cwd: (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
 											? vscode.workspace.workspaceFolders[0].uri.fsPath
@@ -161,14 +165,17 @@ export async function pickJavaKotlinFiles(): Promise<vscode.Uri[] | undefined> {
  */
 export async function compileForDalvik(
 	sourceFiles: vscode.Uri[],
+	sdkVersion: string,
 	androidJarPath: string,
 	sdkPath: string,
 	callback: (success: boolean, outputPath?: string) => void
 ) {
-	const outputDir = path.join(vscode.workspace.rootPath || __dirname, '.dalvikrun');
-	const classesDir = path.join(outputDir, 'classes');
+	const outputDir = path.join(vscode.workspace.rootPath || __dirname, '.dalvikrun',`dex-${sdkVersion}`);
+	const classesDir = path.join(vscode.workspace.rootPath || __dirname, '.dalvikrun','classes');
 
 	fs.rmSync(outputDir, { recursive: true, force: true });
+	fs.rmSync(classesDir, { recursive: true, force: true });
+	fs.mkdirSync(outputDir, { recursive: true });
 	fs.mkdirSync(classesDir, { recursive: true });
 
 	const config = vscode.workspace.getConfiguration('dalvikscript');
@@ -186,7 +193,7 @@ export async function compileForDalvik(
 
 	// Helper to proceed to bytecode packaging after compilation
 	const packageOutput = () => {
-		const outputPath = path.join(outputDir, 'classes.dex');
+		const outputPath = path.join(outputDir,'classes.dex');
 		// locate d8
 		const buildToolsRoot = path.join(sdkPath, 'build-tools');
 		const buildVersions = fs.readdirSync(buildToolsRoot).sort().reverse();
@@ -222,7 +229,6 @@ export async function compileForDalvik(
 			if (generated !== path.join(outputDir, 'classes.dex')) {
 				fs.renameSync(generated, path.join(outputDir, 'classes.dex'));
 			}
-			vscode.window.showInformationMessage(`Dex file created at: ${outputPath}`);
 			callback(true, outputPath);
 		});
 	};
@@ -234,7 +240,7 @@ export async function compileForDalvik(
 			return callback(false);
 		}
 		const stdlibPath = path.join(kotlinPath, 'lib', 'kotlin-stdlib.jar');
-		const ktCmd = `${path.join(kotlinPath, 'bin', 'kotlinc')} -include-runtime -classpath "${[androidJarPath, stdlibPath].join(path.delimiter)}" -d "${classesDir}" ${kotlinFiles.map(f => '"' + f + '"').join(' ')}`;
+		const ktCmd = `${path.join(kotlinPath, 'bin', 'kotlinc')} -include-runtime -classpath "${[androidJarPath].join(path.delimiter)}" -d "${classesDir}" ${kotlinFiles.map(f => '"' + f + '"').join(' ')}`;
 		chp.exec(ktCmd, (err, stdout, stderr) => {
 			if (err) {
 				vscode.window.showErrorMessage(`Kotlin compilation failed: ${stderr || err.message}`);
@@ -322,7 +328,7 @@ export async function downloadAndroidJar(
 
 	const javaHome = vscode.workspace.getConfiguration().get<string>('dalvikscript.javaHome');
 	const sdkManagerPath = path.join(androidSdkPath, 'cmdline-tools', 'latest', 'bin', 'sdkmanager');
-	vscode.window.showInformationMessage(`Downloading android-${apiLevel} using sdkmanager...`);
+	vscode.window.showInformationMessage(`Downloading binaries for android api ${apiLevel}...`);
 
 	// Run sdkmanager
 	chp.exec(
