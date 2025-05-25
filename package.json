@@ -4,7 +4,7 @@
   "displayName": "DalvikScript",
   "description": "Allows Raw Java code to be run on Android Devices, without building apk.",
   "icon": "logo.png",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -28,7 +28,7 @@
       {
         "title": "dalvikscript",
         "properties": {
-          "dalvikscript.androidSdkPath":{
+          "dalvikscript.androidSdkPath": {
             "type": "string",
             "description": "Full path to your android sdk directory. Download it here - https://developer.android.com/studio#command-line-tools-only",
             "default": "C:\\Users\\Admin\\AppData\\Local\\Android\\Sdk"
