@@ -23,11 +23,11 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand('dalvikscript.runOnDevice', async () => {
 
-			const chosen = await pickDevices(adbPath);
+			const chosen = await pickDevices(context,adbPath);
 			if (!chosen || chosen.length === 0) {
 				return; // user cancelled
 			}
-			const files = await pickJavaKotlinFiles();
+			const files = await pickJavaKotlinFiles(context);
 			if (!files || files.length === 0) {
 				vscode.window.showErrorMessage('No Java/Kotlin files selected.');
 				return;
@@ -62,19 +62,21 @@ export function activate(context: vscode.ExtensionContext) {
 									vscode.window.showErrorMessage(`Failed to push to device ${device}: ${stderr || err.message}`);
 								} else {
 									//execution
+									var filesString = files.map(f => f.fsPath).join('+');
 									let dalvikOnly = config.get<boolean>('dalvikOnly');
 									let mainClass = await vscode.window.showInputBox({
 										prompt: 'Enter the main class to run + arguments',
 										placeHolder: 'com.example.Main arg1 arg2',
+										value: context.globalState.get(`dalvikscript.mainClassForFiles.${filesString}`, '')
 									});
 									if (!mainClass) {
 										vscode.window.showErrorMessage('Main class is required to run the script.');
 										return;
 									}
+									context.globalState.update(`dalvikscript.mainClassForFiles.${filesString}`, mainClass);
 									var runCommand = (dalvikOnly)
 										? `${adbPath} -s ${device} shell dalvikvm -cp /data/local/tmp/classes.dex ${mainClass}`
-										: `${adbPath} -s ${device} shell "app_process -Djava.class.path=/data/local/tmp/classes.dex /system/bin ${mainClass}"`;
-
+										: `${adbPath} -s ${device} shell "app_process -Djava.class.path=/data/local/tmp/classes.dex:/system/framework/services.jar:/apex/com.android.services/javalib/services.jar:/apex/com.android.runtime/javalib/core-oj.jar:/system/framework/framework2.jar:/system/framework/services-core.jar /system/bin ${mainClass}"`;
 
 									//Run the command on the vscode terminal
 									const terminal = vscode.window.createTerminal({
@@ -111,7 +113,7 @@ async function checkDevicesPresent(adbPath: string) {
  *
  * Returns an array of URIs the user selected, or undefined if cancelled.
  */
-export async function pickJavaKotlinFiles(): Promise<vscode.Uri[] | undefined> {
+export async function pickJavaKotlinFiles(context: vscode.ExtensionContext): Promise<vscode.Uri[] | undefined> {
 	const openTabs = vscode.window.tabGroups.all
 		.flatMap(group => group.tabs)
 		.filter(tab => {
@@ -131,10 +133,13 @@ export async function pickJavaKotlinFiles(): Promise<vscode.Uri[] | undefined> {
 		[...openEditors, ...workspaceFiles].map(uri => [uri.toString(), uri])
 	).values());
 
+	var savedPicks = context.globalState.get<string[]>('dalvikscript.savedPicks', []);
+
 	// Build QuickPick items
 	const items: vscode.QuickPickItem[] = allUris.map(uri => ({
 		label: vscode.workspace.asRelativePath(uri),
 		description: uri.fsPath,
+		picked: savedPicks.includes(uri.fsPath),
 	}));
 
 	const picked = await vscode.window.showQuickPick(items, {
@@ -142,13 +147,18 @@ export async function pickJavaKotlinFiles(): Promise<vscode.Uri[] | undefined> {
 		placeHolder: 'Select Java/Kotlin files to compile',
 	});
 
+
+
 	if (!picked || picked.length === 0) {
 		return undefined; // user canceled or picked none
 	}
 
+	// Save picked files to global state
+	context.globalState.update('dalvikscript.savedPicks', picked.map(item => item.description));
+
 	// Map back to URIs
 	const selectedUris = picked.map(item => {
-		const match = allUris.find(uri => vscode.workspace.asRelativePath(uri) === item.label);
+		const match = allUris.find(uri => uri.fsPath === item.description);
 		return match!;
 	});
 
@@ -286,16 +296,23 @@ async function listAdbDevices(adbPath: string): Promise<string[]> {
 		.map(line => line.split(/\s+/)[0]);
 }
 
-async function pickDevices(adbPath: string): Promise<string[] | undefined> {
+async function pickDevices(context: vscode.ExtensionContext,adbPath: string): Promise<string[] | undefined> {
 	const devices = await listAdbDevices(adbPath);
 	if (devices.length === 0) {
 		vscode.window.showErrorMessage('No devices detected.');
 		return;
 	}
-	return await vscode.window.showQuickPick(devices, {
+	const savedDevices = context.globalState.get<string[]>('dalvikscript.savedDevices', []);
+	const items: vscode.QuickPickItem[] = devices.map(device => ({
+		label: device,
+		picked: savedDevices.includes(device),
+	}));
+	const targets = await vscode.window.showQuickPick(items, {
 		canPickMany: true,
 		placeHolder: 'Select target device(s)'
 	});
+	context.globalState.update('dalvikscript.savedDevices', targets?.map(item => item.label) || []);
+	return targets?.map(item => item.label) || [];
 }
 
 async function getDeviceSdk(adbPath: string, deviceId: string): Promise<string> {

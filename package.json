@@ -3,8 +3,12 @@
   "publisher": "legendsayantan",
   "displayName": "DalvikScript",
   "description": "Allows Raw Java code to be run on Android Devices, without building apk.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/legendsayantan/dalvikscript"
+    },
   "icon": "logo.png",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "engines": {
     "vscode": "^1.100.0"
   },
