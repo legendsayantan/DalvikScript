@@ -482,6 +482,7 @@ export async function compileForDalvik(
 
 	const outputPath = path.join(outputDir, 'classes.dex');
 	const dexArgs    = [
+		'--lib', wrap(androidJarPath),
 		'--output', wrap(outputDir),
 		...classFiles.map(wrap)
 	];
