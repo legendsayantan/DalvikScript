@@ -26,10 +26,8 @@ This extension contributes the following settings:
 
 ## Instructions
 
-**Write and save a java file, Connect an android device via USB/Wireless Debugging, then Click on the button 'Run on Android' to get started.**
+**Write and save a java/kotlin file, Connect an android device via USB/Wireless Debugging, then Click on the button 'Run on Android' to get started.**
 
 Check the demo folder for general things you can control via DalvikScript, or explore android source to find useful snippets you can invoke using Java Reflection.
 
 In case you cannot see errors or stacktraces on the terminal output, implement `Thread.setDefaultUncaughtExceptionHandler` in your code and redirect the stack trace to stdout. 
-
-Compiling kotlin files may not work properly right now.
