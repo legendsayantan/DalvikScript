@@ -1,7 +1,10 @@
 import android.annotation.SuppressLint
 import dalvik.system.DexFile
 import java.lang.reflect.Modifier
-
+/**
+ * Deep Reflection Scanner for Android
+ * Compile and run via DalvikScript to dump complete class hierarchies, as they exist on your system.
+ */
 object ClassScanner {
 
     @JvmStatic
