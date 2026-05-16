@@ -8,7 +8,7 @@
     "url": "https://github.com/legendsayantan/dalvikscript"
   },
   "icon": "logo.png",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "engines": {
     "vscode": "^1.100.0"
   },
