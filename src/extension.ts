@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as chp from 'child_process';
 import * as util from 'util';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -9,6 +10,12 @@ const execFile = util.promisify(chp.execFile);
 
 // Helper constant to identify Windows
 const isWin = process.platform === 'win32';
+
+// ── Child-process timeout constants (milliseconds) ────────────────────────────
+const TIMEOUT_ADB_FAST   =   10_000;  // adb devices, getprop
+const TIMEOUT_ADB_PUSH   =   60_000;  // adb push (file transfer)
+const TIMEOUT_COMPILE    =  120_000;  // kotlinc, javac, d8
+const TIMEOUT_SDKMANAGER = 1800_000;  // sdkmanager platform download
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -58,6 +65,24 @@ function javacBinary(): string {
 	return isWin ? 'javac.exe' : 'javac';
 }
 
+/** The three shell families that require distinct escaping and invocation rules. */
+type ShellKind = 'bash' | 'powershell' | 'cmd';
+
+/**
+ * Identifies the shell family VS Code's integrated terminal is using.
+ * 'bash' covers bash, zsh, sh, fish, and any other POSIX-ish shell.
+ */
+function detectShell(): ShellKind {
+	const bin = path.basename(vscode.env.shell ?? '').toLowerCase();
+	if (bin === 'powershell.exe' || bin === 'pwsh' || bin === 'pwsh.exe') {
+		return 'powershell';
+	}
+	if (bin === 'cmd.exe') {
+		return 'cmd';
+	}
+	return 'bash';
+}
+
 /**
  * Returns the prefix required to invoke a double-quoted executable path in
  * whichever shell VS Code's integrated terminal is configured to use.
@@ -73,10 +98,74 @@ function javacBinary(): string {
  * accurate signal, because it is exactly what createTerminal will open.
  */
 function shellCallPrefix(): string {
-	const shell = vscode.env.shell ?? '';
-	const bin   = path.basename(shell).toLowerCase();
-	const isPowerShell = bin === 'powershell.exe' || bin === 'pwsh' || bin === 'pwsh.exe';
-	return isPowerShell ? '& ' : '';
+	return detectShell() === 'powershell' ? '& ' : '';
+}
+
+/**
+ * Escapes mainClass (FQCN + optional arguments) for safe interpolation into a
+ * terminal shell command while preserving spaces as argument separators.
+ *
+ * Two contexts are handled:
+ *
+ *   'unquoted'  – the value appears as bare tokens at the end of the command
+ *                 (dalvikOnly path). Every space-delimited token is
+ *                 individually quoted so metacharacters are literal while
+ *                 word-splitting still separates class name from args.
+ *
+ *   'inDQuotes' – the value is embedded inside an existing "…" string that
+ *                 the local shell already parses (app_process path). Only
+ *                 chars that are special inside double-quotes are escaped;
+ *                 spaces remain as-is so the Android shell can still split
+ *                 the class name from its arguments.
+ */
+function escapeMainClass(
+	value: string,
+	context: 'unquoted' | 'inDQuotes',
+	shell: ShellKind
+): string {
+	if (context === 'unquoted') {
+		const tokens = value.trim().split(/\s+/).filter(Boolean);
+		switch (shell) {
+			case 'powershell':
+				// PowerShell double-quotes: backtick-escape internal metacharacters.
+				return tokens
+					.map(t => `"${t.replace(/`/g, '``').replace(/"/g, '`"').replace(/\$/g, '`$')}"`)
+					.join(' ');
+			case 'cmd':
+				// cmd.exe double-quotes: escape % (variable expansion) and " (quote break).
+				return tokens
+					.map(t => `"${t.replace(/%/g, '%%').replace(/"/g, '""')}"`)
+					.join(' ');
+			default:
+				// bash / zsh / sh: single-quote each token; escape embedded single-quotes.
+				return tokens
+					.map(t => `'${t.replace(/'/g, "'\\''")}'`)
+					.join(' ');
+		}
+	}
+
+	// context === 'inDQuotes'
+	switch (shell) {
+		case 'powershell':
+			// Inside a PowerShell double-quoted string: backtick-escape metacharacters.
+			return value
+				.replace(/`/g, '``')
+				.replace(/"/g, '`"')
+				.replace(/\$/g, '`$');
+		case 'cmd':
+			// Inside cmd.exe double-quotes: % still expands; " breaks the string.
+			return value
+				.replace(/%/g, '%%')
+				.replace(/"/g, '""');
+		default:
+			// Inside a bash/zsh double-quoted string: only \, $, `, ", ! are special.
+			return value
+				.replace(/\\/g, '\\\\')
+				.replace(/\$/g, '\\$')
+				.replace(/`/g, '\\`')
+				.replace(/"/g, '\\"')
+				.replace(/!/g, '\\!');
+	}
 }
 
 let outputChannel: vscode.OutputChannel;
@@ -87,57 +176,65 @@ export function activate(context: vscode.ExtensionContext) {
 	outputChannel = vscode.window.createOutputChannel('DalvikScript');
 	context.subscriptions.push(outputChannel);
 
-	const config         = vscode.workspace.getConfiguration('dalvikscript');
-	const androidSdkPath = config.get<string>('androidSdkPath');
-	
-	if (!androidSdkPath || !fs.existsSync(androidSdkPath)) {
-		showErrorWithSettings(
-			'Android SDK path is missing or invalid. Please configure dalvikscript.androidSdkPath.', 
-			'dalvikscript.androidSdkPath'
-		);
-		return;
-	}
-
-	const adbPath = path.join(androidSdkPath, 'platform-tools', adbBinary());
-	if (!fs.existsSync(adbPath)) {
-		showErrorWithSettings(
-			`adb not found at "${adbPath}". Please verify dalvikscript.androidSdkPath.`,
-			'dalvikscript.androidSdkPath'
-		);
-		return;
-	}
-
-	checkDevicesPresent(adbPath);
-
 	context.subscriptions.push(
 		vscode.commands.registerCommand('dalvikscript.runOnDevice', async () => {
+			// Re-read config on every invocation so settings changes take effect
+			// without restarting VS Code (Bug 3: validation moved here from activate).
+			const config         = vscode.workspace.getConfiguration('dalvikscript');
+			const androidSdkPath = config.get<string>('androidSdkPath');
+
+			if (!androidSdkPath || !fs.existsSync(androidSdkPath)) {
+				showErrorWithSettings(
+					'Android SDK path is missing or invalid. Please configure dalvikscript.androidSdkPath.',
+					'dalvikscript.androidSdkPath'
+				);
+				return;
+			}
+
+			const adbPath = path.join(androidSdkPath, 'platform-tools', adbBinary());
+			if (!fs.existsSync(adbPath)) {
+				showErrorWithSettings(
+					`adb not found at "${adbPath}". Please verify dalvikscript.androidSdkPath.`,
+					'dalvikscript.androidSdkPath'
+				);
+				return;
+			}
+
 			const chosen = await pickDevices(context, adbPath);
 			if (!chosen || chosen.length === 0) {
 				return; // user cancelled
 			}
 
 			const files = await pickJavaKotlinFiles(context);
-			if (!files || files.length === 0) {
-				vscode.window.showErrorMessage('No Java/Kotlin files selected.');
-				return;
+			if (!files) {
+				return; // cancelled (silent) or empty (error already shown in pickJavaKotlinFiles)
 			}
 
 			// Ask for main class once -- before looping over devices.
-			const filesString = files.map(f => f.fsPath).join('+');
+			// Build a stable, collision-free globalState key by hashing the sorted,
+			// NUL-delimited paths with SHA-256.  Raw path concatenation with '+' is
+			// ambiguous (a path may contain '+'), order-dependent, and unbounded in
+			// length.  Sorting makes the key identical regardless of pick order;
+			// NUL as separator is unambiguous because it cannot appear in a path.
+			const filesKey = crypto
+				.createHash('sha256')
+				.update(files.map(f => f.fsPath).sort().join('\0'))
+				.digest('hex');
 			const dalvikOnly  = config.get<boolean>('dalvikOnly');
 			const mainClass   = await vscode.window.showInputBox({
 				prompt:      'Enter the main class to run (optionally followed by arguments)',
 				placeHolder: 'com.example.Main arg1 arg2',
-				value:       context.globalState.get(`dalvikscript.mainClassForFiles.${filesString}`, ''),
+				value:       context.globalState.get(`dalvikscript.mainClassForFiles.${filesKey}`, ''),
 			});
 			if (!mainClass) {
 				vscode.window.showErrorMessage('Main class is required to run the script.');
 				return;
 			}
-			await context.globalState.update(`dalvikscript.mainClassForFiles.${filesString}`, mainClass);
+			await context.globalState.update(`dalvikscript.mainClassForFiles.${filesKey}`, mainClass);
 
 			// Detect the active shell once, then build every runCommand from it.
-			const prefix    = shellCallPrefix();
+			const shell     = detectShell();
+			const prefix    = shell === 'powershell' ? '& ' : '';
 			const adbInvoke = prefix ? `${prefix}${q(adbPath)}` : q(adbPath);
 			outputChannel.appendLine(
 				`[shell] ${vscode.env.shell ?? '(unknown)'}  prefix=${JSON.stringify(prefix)}`
@@ -194,23 +291,28 @@ export function activate(context: vscode.ExtensionContext) {
 				for (const device of devices) {
 					try {
 						// execFile uses an argument array so the OS handles quoting natively.
-						await execFile(adbPath, ['-s', device, 'push', outputPath, '/data/local/tmp/']);
+						await execFile(adbPath, ['-s', device, 'push', outputPath, '/data/local/tmp/'], { timeout: TIMEOUT_ADB_PUSH });
 					} catch (e: any) {
 						vscode.window.showErrorMessage(`Failed to push to ${device}: ${e.message}`);
 						continue;
 					}
 
-					// adbInvoke integrates smoothly with Bash/ZSH (Linux/Mac) and PowerShell/CMD (Windows).
+					// Escape the device serial and mainClass for the active shell.
+					// Device serials (e.g. emulator-5554, 192.168.1.1:5555) are
+					// normally safe, but escaping them closes the same injection
+					// class as mainClass and costs nothing.
+					const safeDevice = escapeMainClass(device, 'unquoted', shell);
 					const runCommand = dalvikOnly
-						? `${adbInvoke} -s ${device} shell dalvikvm -cp /data/local/tmp/classes.dex ${mainClass}`
-						: `${adbInvoke} -s ${device} shell "app_process` +
+						? `${adbInvoke} -s ${safeDevice} shell dalvikvm -cp /data/local/tmp/classes.dex` +
+						  ` ${escapeMainClass(mainClass, 'unquoted', shell)}`
+						: `${adbInvoke} -s ${safeDevice} shell "app_process` +
 						  ` -Djava.class.path=/data/local/tmp/classes.dex` +
 						  `:/system/framework/services.jar` +
 						  `:/apex/com.android.services/javalib/services.jar` +
 						  `:/apex/com.android.runtime/javalib/core-oj.jar` +
 						  `:/system/framework/framework2.jar` +
 						  `:/system/framework/services-core.jar` +
-						  ` /system/bin ${mainClass}"`;
+						  ` /system/bin ${escapeMainClass(mainClass, 'inDQuotes', shell)}"`;
 
 					outputChannel.appendLine(`[run] ${runCommand}`);
 					const terminal = vscode.window.createTerminal({
@@ -223,6 +325,17 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 		})
 	);
+
+	// Best-effort startup check: if the SDK is already configured, notify the
+	// user about any connected devices.  This never blocks command registration.
+	{
+		const cfg     = vscode.workspace.getConfiguration('dalvikscript');
+		const sdkPath = cfg.get<string>('androidSdkPath');
+		if (sdkPath && fs.existsSync(sdkPath)) {
+			const adb = path.join(sdkPath, 'platform-tools', adbBinary());
+			if (fs.existsSync(adb)) { checkDevicesPresent(adb); }
+		}
+	}
 }
 
 // ── Device helpers ────────────────────────────────────────────────────────────
@@ -241,7 +354,7 @@ async function checkDevicesPresent(adbPath: string) {
 }
 
 async function listAdbDevices(adbPath: string): Promise<string[]> {
-	const { stdout } = await execFile(adbPath, ['devices']);
+	const { stdout } = await execFile(adbPath, ['devices'], { timeout: TIMEOUT_ADB_FAST });
 	return stdout
 		.split('\n')
 		.filter(line => line.trim().endsWith('device'))
@@ -252,7 +365,15 @@ async function pickDevices(
 	context: vscode.ExtensionContext,
 	adbPath: string
 ): Promise<string[] | undefined> {
-	const devices = await listAdbDevices(adbPath);
+	let devices: string[];
+	try {
+		devices = await listAdbDevices(adbPath);
+	} catch (e: any) {
+		vscode.window.showErrorMessage(
+			`Failed to query ADB devices: ${e.message ?? String(e)}`
+		);
+		return undefined;
+	}
 	if (devices.length === 0) {
 		vscode.window.showErrorMessage('No ADB devices detected. Make sure USB debugging is enabled.');
 		return;
@@ -266,15 +387,20 @@ async function pickDevices(
 		canPickMany:  true,
 		placeHolder: 'Select target device(s)',
 	});
-	await context.globalState.update(
-		'dalvikscript.savedDevices',
-		targets?.map(item => item.label) ?? []
-	);
-	return targets?.map(item => item.label) ?? [];
+	// Only persist the selection when the user explicitly confirms (targets is
+	// defined).  If they press Escape, showQuickPick returns undefined and we
+	// leave the previously saved devices untouched (Bug 4 fix).
+	if (targets !== undefined) {
+		await context.globalState.update(
+			'dalvikscript.savedDevices',
+			targets.map(item => item.label)
+		);
+	}
+	return targets?.map(item => item.label);
 }
 
 async function getDeviceSdk(adbPath: string, deviceId: string): Promise<string> {
-	const { stdout } = await execFile(adbPath, ['-s', deviceId, 'shell', 'getprop', 'ro.build.version.sdk']);
+	const { stdout } = await execFile(adbPath, ['-s', deviceId, 'shell', 'getprop', 'ro.build.version.sdk'], { timeout: TIMEOUT_ADB_FAST });
 	const sdk = stdout.trim();
 	if (!sdk) {
 		throw new Error(`Empty SDK version returned for device ${deviceId}.`);
@@ -322,7 +448,12 @@ export async function pickJavaKotlinFiles(
 		placeHolder: 'Select Java/Kotlin files to compile',
 	});
 
-	if (!picked || picked.length === 0) {
+	if (picked === undefined) {
+		// User pressed Escape — treat as a deliberate abort, not an error.
+		return undefined;
+	}
+	if (picked.length === 0) {
+		vscode.window.showErrorMessage('No Java/Kotlin files selected.');
 		return undefined;
 	}
 
@@ -394,8 +525,12 @@ export async function compileForDalvik(
 			throw new Error(`Kotlin compiler not found at "${kotlincPath}". Please verify dalvikscript.kotlincPath.`);
 		}
 		
+		const includeRuntime = config.get<boolean>('kotlinIncludeRuntime', false);
 		const ktArgs = [
-			'-include-runtime',
+			// -include-runtime embeds the entire Kotlin stdlib (~1.6 MB) into the
+			// jar before it is DEX'd.  Omit it when the runtime is already present
+			// on the device (the common case for rooted / shell-accessible devices).
+			...(includeRuntime ? ['-include-runtime'] : []),
 			'-classpath', wrap(androidJarPath),
 			'-d', wrap(ktJarPath),
 			...kotlinFiles.map(wrap)
@@ -410,7 +545,8 @@ export async function compileForDalvik(
 			const { stdout, stderr } = await execFile(ktExe, ktArgs, { 
 				env: javaEnv, 
 				shell: isWin,
-				cwd: isWin ? path.dirname(kotlincPath) : undefined 
+				cwd: isWin ? path.dirname(kotlincPath) : undefined,
+				timeout: TIMEOUT_COMPILE,
 			});
 			if (stdout?.trim()) { outputChannel.appendLine(`[kotlinc output]\n${stdout.trim()}`); }
 			if (stderr?.trim()) { outputChannel.appendLine(`[kotlinc stderr]\n${stderr.trim()}`); }
@@ -439,7 +575,7 @@ export async function compileForDalvik(
 		try {
 			// javac is a native executable (.exe), it doesn't need to be run through cmd.exe. 
 			// Calling it directly prevents cmd.exe from improperly stripping quotes around spaces.
-			const { stdout, stderr } = await execFile(javacPath, jtArgs, { env: javaEnv });
+			const { stdout, stderr } = await execFile(javacPath, jtArgs, { env: javaEnv, timeout: TIMEOUT_COMPILE });
 			if (stdout?.trim()) { outputChannel.appendLine(`[javac output]\n${stdout.trim()}`); }
 			if (stderr?.trim()) { outputChannel.appendLine(`[javac stderr]\n${stderr.trim()}`); }
 		} catch (e: any) {
@@ -452,7 +588,17 @@ export async function compileForDalvik(
 	const buildToolsRoot = path.join(sdkPath, 'build-tools');
 	let buildVersions: string[];
 	try {
-		buildVersions = fs.readdirSync(buildToolsRoot).sort().reverse();
+		// Sort descending by numeric version components so 33.0.10 > 33.0.2.
+		// A plain .sort() is lexicographic: '33.0.2' > '33.0.10' because '2' > '1'.
+		buildVersions = fs.readdirSync(buildToolsRoot).sort((a, b) => {
+			const pa = a.split('.').map(Number);
+			const pb = b.split('.').map(Number);
+			for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+				const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
+				if (diff !== 0) { return diff; }
+			}
+			return 0;
+		});
 	} catch {
 		throw new Error(`build-tools directory not found under "${buildToolsRoot}".`);
 	}
@@ -493,7 +639,8 @@ export async function compileForDalvik(
 		const { stdout, stderr } = await execFile(d8Exe, dexArgs, { 
 			env: javaEnv, 
 			shell: isWin,
-			cwd: isWin ? path.dirname(toolPath) : undefined 
+			cwd: isWin ? path.dirname(toolPath) : undefined,
+			timeout: TIMEOUT_COMPILE,
 		});
 		if (stdout?.trim()) { outputChannel.appendLine(`[d8 output]\n${stdout.trim()}`); }
 		if (stderr?.trim()) { outputChannel.appendLine(`[d8 stderr]\n${stderr.trim()}`); }
@@ -549,15 +696,32 @@ export async function downloadAndroidJar(apiLevel: string): Promise<string> {
 
 	try {
 		const sdkExe = isWin ? path.basename(sdkManagerPath) : sdkManagerPath;
+		// sdkmanager prompts "Accept? (y/N)" for each SDK license before downloading.
+		// Without stdin input the process blocks indefinitely. Piping repeated 'y\n'
+		// answers every prompt automatically, mirroring `yes | sdkmanager ...`.
+		//
+		// JAVA_HOME alone is not sufficient: sdkmanager's own launch script
+		// resolves the java binary through PATH, not JAVA_HOME. Prepend
+		// JAVA_HOME/bin so that the correct JDK is found even when java is not
+		// on the system PATH at all.
+		const sysPath  = process.env.PATH ?? process.env.Path ?? '';
+		const sdkEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			JAVA_HOME: javaHome,
+			PATH: `${path.join(javaHome, 'bin')}${path.delimiter}${sysPath}`,
+			SKIP_JDK_VERSION_CHECK: 'true',
+		};
+		// Windows cmd.exe may consult 'Path' instead of (or in addition to) 'PATH'.
+		if (isWin && 'Path' in process.env) {
+			sdkEnv.Path = sdkEnv.PATH;
+		}
 		const { stdout, stderr } = await execFile(sdkExe, args, {
-			env: {
-				...process.env,
-				JAVA_HOME: javaHome,
-				SKIP_JDK_VERSION_CHECK: 'true',
-			},
+			env: sdkEnv,
 			shell: isWin,
-			cwd: isWin ? path.dirname(sdkManagerPath) : undefined
-		});
+			cwd: isWin ? path.dirname(sdkManagerPath) : undefined,
+			input: 'y\n'.repeat(20),
+			timeout: TIMEOUT_SDKMANAGER,
+		} as any);
 		if (stdout?.trim()) { outputChannel.appendLine(`[sdkmanager output]\n${stdout.trim()}`); }
 		if (stderr?.trim()) { outputChannel.appendLine(`[sdkmanager stderr]\n${stderr.trim()}`); }
 	} catch (e: any) {

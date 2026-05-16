@@ -50,6 +50,11 @@
             "type": "boolean",
             "description": "Run as dalvik only, not app_process",
             "default": false
+          },
+          "dalvikscript.kotlinIncludeRuntime": {
+            "type": "boolean",
+            "description": "Bundle the entire Kotlin standard library (~1.6 MB) into the DEX. Only enable this if your device does not already have the Kotlin runtime available (e.g. older AOSP builds). Leave disabled to keep DEX size minimal.",
+            "default": false
           }
         }
       }
