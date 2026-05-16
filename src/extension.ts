@@ -12,10 +12,10 @@ const execFile = util.promisify(chp.execFile);
 const isWin = process.platform === 'win32';
 
 // ── Child-process timeout constants (milliseconds) ────────────────────────────
-const TIMEOUT_ADB_FAST   =   10_000;  // adb devices, getprop
-const TIMEOUT_ADB_PUSH   =   60_000;  // adb push (file transfer)
-const TIMEOUT_COMPILE    =  120_000;  // kotlinc, javac, d8
-const TIMEOUT_SDKMANAGER = 1800_000;  // sdkmanager platform download
+const TIMEOUT_ADB_FAST   =  10_000;  // adb devices, getprop
+const TIMEOUT_ADB_PUSH   =  60_000;  // adb push (file transfer)
+const TIMEOUT_COMPILE    = 120_000;  // kotlinc, javac, d8
+const TIMEOUT_SDKMANAGER = 600_000;  // sdkmanager platform download
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -354,7 +354,7 @@ async function checkDevicesPresent(adbPath: string) {
 }
 
 async function listAdbDevices(adbPath: string): Promise<string[]> {
-	const { stdout } = await execFile(adbPath, ['devices'], { timeout: TIMEOUT_ADB_FAST });
+	const { stdout } = await execFile(adbPath, ['devices'], { timeout: TIMEOUT_ADB_FAST, encoding: 'utf8' as const });
 	return stdout
 		.split('\n')
 		.filter(line => line.trim().endsWith('device'))
@@ -400,7 +400,7 @@ async function pickDevices(
 }
 
 async function getDeviceSdk(adbPath: string, deviceId: string): Promise<string> {
-	const { stdout } = await execFile(adbPath, ['-s', deviceId, 'shell', 'getprop', 'ro.build.version.sdk'], { timeout: TIMEOUT_ADB_FAST });
+	const { stdout } = await execFile(adbPath, ['-s', deviceId, 'shell', 'getprop', 'ro.build.version.sdk'], { timeout: TIMEOUT_ADB_FAST, encoding: 'utf8' as const });
 	const sdk = stdout.trim();
 	if (!sdk) {
 		throw new Error(`Empty SDK version returned for device ${deviceId}.`);
@@ -547,6 +547,7 @@ export async function compileForDalvik(
 				shell: isWin,
 				cwd: isWin ? path.dirname(kotlincPath) : undefined,
 				timeout: TIMEOUT_COMPILE,
+				encoding: 'utf8' as const,
 			});
 			if (stdout?.trim()) { outputChannel.appendLine(`[kotlinc output]\n${stdout.trim()}`); }
 			if (stderr?.trim()) { outputChannel.appendLine(`[kotlinc stderr]\n${stderr.trim()}`); }
@@ -575,7 +576,7 @@ export async function compileForDalvik(
 		try {
 			// javac is a native executable (.exe), it doesn't need to be run through cmd.exe. 
 			// Calling it directly prevents cmd.exe from improperly stripping quotes around spaces.
-			const { stdout, stderr } = await execFile(javacPath, jtArgs, { env: javaEnv, timeout: TIMEOUT_COMPILE });
+			const { stdout, stderr } = await execFile(javacPath, jtArgs, { env: javaEnv, timeout: TIMEOUT_COMPILE, encoding: 'utf8' as const });
 			if (stdout?.trim()) { outputChannel.appendLine(`[javac output]\n${stdout.trim()}`); }
 			if (stderr?.trim()) { outputChannel.appendLine(`[javac stderr]\n${stderr.trim()}`); }
 		} catch (e: any) {
@@ -641,6 +642,7 @@ export async function compileForDalvik(
 			shell: isWin,
 			cwd: isWin ? path.dirname(toolPath) : undefined,
 			timeout: TIMEOUT_COMPILE,
+			encoding: 'utf8' as const,
 		});
 		if (stdout?.trim()) { outputChannel.appendLine(`[d8 output]\n${stdout.trim()}`); }
 		if (stderr?.trim()) { outputChannel.appendLine(`[d8 stderr]\n${stderr.trim()}`); }
@@ -715,13 +717,22 @@ export async function downloadAndroidJar(apiLevel: string): Promise<string> {
 		if (isWin && 'Path' in process.env) {
 			sdkEnv.Path = sdkEnv.PATH;
 		}
-		const { stdout, stderr } = await execFile(sdkExe, args, {
+		// 'input' is processed by Node's execFile at runtime (it writes to stdin and
+		// calls .end()) but is absent from @types/node's ExecFileOptions.  Cast the
+		// function itself so we can pass it without breaking overload resolution,
+		// then restore the return type explicitly.
+		type ExecFileWithInput = (
+			file: string, args: readonly string[],
+			opts: chp.ExecFileOptionsWithStringEncoding & { input?: string }
+		) => Promise<{ stdout: string; stderr: string }>;
+		const { stdout, stderr } = await (execFile as unknown as ExecFileWithInput)(sdkExe, args, {
 			env: sdkEnv,
 			shell: isWin,
 			cwd: isWin ? path.dirname(sdkManagerPath) : undefined,
 			input: 'y\n'.repeat(20),
 			timeout: TIMEOUT_SDKMANAGER,
-		} as any);
+			encoding: 'utf8',
+		});
 		if (stdout?.trim()) { outputChannel.appendLine(`[sdkmanager output]\n${stdout.trim()}`); }
 		if (stderr?.trim()) { outputChannel.appendLine(`[sdkmanager stderr]\n${stderr.trim()}`); }
 	} catch (e: any) {
