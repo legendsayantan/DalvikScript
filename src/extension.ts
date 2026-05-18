@@ -516,6 +516,9 @@ export async function compileForDalvik(
 	}
 
 	// ── 1) Kotlin compilation ─────────────────────────────────────────────────
+	// Hoisted so the d8 step below can decide whether to add kotlin-stdlib.jar.
+	const includeRuntime = config.get<boolean>('kotlinIncludeRuntime', false);
+
 	if (kotlinFiles.length) {
 		if (!kotlinPath || !fs.existsSync(kotlinPath)) {
 			throw new Error('Kotlin compiler path is missing or invalid. Please check dalvikscript.kotlincPath.');
@@ -524,8 +527,7 @@ export async function compileForDalvik(
 		if (!fs.existsSync(kotlincPath)) {
 			throw new Error(`Kotlin compiler not found at "${kotlincPath}". Please verify dalvikscript.kotlincPath.`);
 		}
-		
-		const includeRuntime = config.get<boolean>('kotlinIncludeRuntime', false);
+
 		const ktArgs = [
 			// -include-runtime embeds the entire Kotlin stdlib (~1.6 MB) into the
 			// jar before it is DEX'd.  Omit it when the runtime is already present
@@ -621,6 +623,38 @@ export async function compileForDalvik(
 
 	if (kotlinFiles.length && fs.existsSync(ktJarPath)) {
 		classFiles.push(ktJarPath);
+
+		// When -include-runtime is NOT used, kotlinc produces a jar that contains
+		// only the user's classes.  Kotlin lambda types (Function0, Function1, ...),
+		// collections helpers, and every other stdlib symbol are absent from the
+		// dex unless we feed the stdlib jars to d8 explicitly.
+		//
+		// Modern kotlinc (>= 1.8) ships a single merged kotlin-stdlib.jar.
+		// Older installations split the JDK extensions into separate jars;
+		// we add all three if they exist so the build works regardless of version.
+		if (!includeRuntime && kotlinPath) {
+			const stdlibCandidates = [
+				'kotlin-stdlib.jar',
+				'kotlin-stdlib-jdk7.jar',   // merged into stdlib in 1.8; harmless if absent
+				'kotlin-stdlib-jdk8.jar',   // merged into stdlib in 1.8; harmless if absent
+			];
+			let foundAny = false;
+			for (const jar of stdlibCandidates) {
+				const jarPath = path.join(kotlinPath, 'lib', jar);
+				if (fs.existsSync(jarPath)) {
+					classFiles.push(jarPath);
+					outputChannel.appendLine(`[d8] including ${jar}: ${q(jarPath)}`);
+					foundAny = true;
+				}
+			}
+			if (!foundAny) {
+				outputChannel.appendLine(
+					`[d8] warning: kotlin-stdlib.jar not found under "${path.join(kotlinPath, 'lib')}". ` +
+					`Lambda types will be missing at runtime. ` +
+					`Either enable dalvikscript.kotlinIncludeRuntime or verify dalvikscript.kotlincPath.`
+				);
+			}
+		}
 	}
 
 	if (classFiles.length === 0) {
